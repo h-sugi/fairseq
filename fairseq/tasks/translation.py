@@ -241,8 +241,8 @@ class TranslationConfig(FairseqDataclass):
             "use 'space' to disable detokenization; see fairseq.data.encoders for other options"
         },
     )
-    eval_bleu_detok_args: str = field(
-        default="{}",
+    eval_bleu_detok_args: Optional[str] = field(
+        default=None,
         metadata={"help": "args for building the tokenizer, if needed, as JSON string"},
     )
     eval_tokenized_bleu: bool = field(
