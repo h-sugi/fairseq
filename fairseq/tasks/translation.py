@@ -228,8 +228,8 @@ class TranslationConfig(FairseqDataclass):
     eval_bleu: bool = field(
         default=False, metadata={"help": "evaluation with BLEU scores"}
     )
-    eval_bleu_args: str = field(
-        default="{}",
+    eval_bleu_args: Optional[str] = field(
+        default=None,
         metadata={
             "help": 'generation args for BLUE scoring, e.g., \'{"beam": 4, "lenpen": 0.6}\', as JSON string'
         },
