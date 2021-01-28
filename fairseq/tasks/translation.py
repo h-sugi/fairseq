@@ -229,7 +229,7 @@ class TranslationConfig(FairseqDataclass):
         default=False, metadata={"help": "evaluation with BLEU scores"}
     )
     eval_bleu_args: Optional[str] = field(
-        default=None,
+        default="{}",
         metadata={
             "help": 'generation args for BLUE scoring, e.g., \'{"beam": 4, "lenpen": 0.6}\', as JSON string'
         },
@@ -242,7 +242,7 @@ class TranslationConfig(FairseqDataclass):
         },
     )
     eval_bleu_detok_args: Optional[str] = field(
-        default=None,
+        default="{}",
         metadata={"help": "args for building the tokenizer, if needed, as JSON string"},
     )
     eval_tokenized_bleu: bool = field(
