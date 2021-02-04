@@ -16,9 +16,10 @@ from itertools import chain
 from typing import Any, Dict, List
 
 import torch
-from fairseq import checkpoint_utils, distributed_utils, models, optim, utils
+from fairseq import checkpoint_utils, models, optim, utils
 from fairseq.dataclass.configs import FairseqConfig
 from fairseq.dataclass.utils import convert_namespace_to_omegaconf
+from fairseq.distributed import utils as distributed_utils
 from fairseq.file_io import PathManager
 from fairseq.logging import meters, metrics
 from fairseq.nan_detector import NanDetector
@@ -69,7 +70,12 @@ class Trainer(object):
         elif cfg.common.bf16:
             self._criterion = self._criterion.to(dtype=torch.bfloat16)
             self._model = self._model.to(dtype=torch.bfloat16)
-        if not cfg.distributed_training.pipeline_model_parallel:
+        if (
+            not cfg.distributed_training.pipeline_model_parallel
+            # the DistributedFairseqModel wrapper will handle moving to device,
+            # so only handle cases which don't use the wrapper
+            and not self.use_distributed_wrapper
+        ):
             self._criterion = self._criterion.to(device=self.device)
             self._model = self._model.to(device=self.device)
         self.pipeline_model_parallel = cfg.distributed_training.pipeline_model_parallel
@@ -159,17 +165,24 @@ class Trainer(object):
         return self.data_parallel_rank == 0
 
     @property
+    def use_distributed_wrapper(self) -> bool:
+        return (
+            self.data_parallel_world_size > 1
+            and not self.cfg.optimization.use_bmuf
+        )
+
+    @property
     def criterion(self):
         if self._wrapped_criterion is None:
             if (
                 utils.has_parameters(self._criterion)
-                and self.data_parallel_world_size > 1
-                and not self.cfg.optimization.use_bmuf
+                and self.use_distributed_wrapper
             ):
                 self._wrapped_criterion = models.DistributedFairseqModel(
                     self.cfg.distributed_training,
                     self._criterion,
                     process_group=self.data_parallel_process_group,
+                    device=self.device,
                 )
             else:
                 self._wrapped_criterion = self._criterion
@@ -178,11 +191,12 @@ class Trainer(object):
     @property
     def model(self):
         if self._wrapped_model is None:
-            if self.data_parallel_world_size > 1 and not self.cfg.optimization.use_bmuf:
+            if self.use_distributed_wrapper:
                 self._wrapped_model = models.DistributedFairseqModel(
                     self.cfg.distributed_training,
                     self._model,
                     process_group=self.data_parallel_process_group,
+                    device=self.device,
                 )
             else:
                 self._wrapped_model = self._model
@@ -268,8 +282,8 @@ class Trainer(object):
             checkpoint_utils.save_state(
                 filename,
                 self.cfg,
-                self.get_model().state_dict(),
-                self.get_criterion(),
+                self.model.state_dict(),
+                self.criterion,
                 self.optimizer,
                 self.lr_scheduler,
                 self.get_num_updates(),
@@ -336,7 +350,7 @@ class Trainer(object):
 
             # load model parameters
             try:
-                self.get_model().load_state_dict(
+                self.model.load_state_dict(
                     state["model"], strict=True, model_cfg=self.cfg.model
                 )
                 if utils.has_parameters(self.get_criterion()):
@@ -600,11 +614,7 @@ class Trainer(object):
                 ooms,
                 total_train_time,
             ) = self._aggregate_logging_outputs(
-                logging_outputs,
-                sample_size,
-                ooms,
-                train_time,
-                ignore=is_dummy_batch,
+                logging_outputs, sample_size, ooms, train_time, ignore=is_dummy_batch
             )
             self._cumulative_training_time = (
                 total_train_time / self.data_parallel_world_size
@@ -646,7 +656,7 @@ class Trainer(object):
             if not self.tpu:
                 if (
                     not self.cfg.optimization.use_bmuf
-                    and self.cfg.distributed_training.distributed_wrapper != "SlowMo"
+                    and self.cfg.distributed_training.ddp_backend != "slow_mo"
                 ):
                     self._check_grad_norms(grad_norm)
                 if not torch.isfinite(grad_norm).all():
@@ -686,7 +696,8 @@ class Trainer(object):
                 logger.error("OOM during optimization, irrecoverable")
             raise e
 
-        # Some distributed wrappers (e.g., SlowMo) need access to the optimizer after the step
+        # Some distributed wrappers (e.g., SlowMo) need access to the optimizer
+        # after the step
         if hasattr(self.model, "perform_additional_optimizer_actions"):
             if hasattr(self.optimizer, "fp32_params"):
                 self.model.perform_additional_optimizer_actions(
@@ -698,10 +709,7 @@ class Trainer(object):
                 )
 
         logging_output = None
-        if (
-            not overflow
-            or self.cfg.distributed_training.distributed_wrapper == "SlowMo"
-        ):
+        if not overflow or self.cfg.distributed_training.ddp_backend == "slow_mo":
             self.set_num_updates(self.get_num_updates() + 1)
 
             if self.tpu:
@@ -719,24 +727,14 @@ class Trainer(object):
                     gb_free = mem_info["kb_free"] / 1024 / 1024
                     gb_total = mem_info["kb_total"] / 1024 / 1024
                     metrics.log_scalar(
-                        "gb_free",
-                        gb_free,
-                        priority=1500,
-                        round=1,
-                        weight=0,
+                        "gb_free", gb_free, priority=1500, round=1, weight=0
                     )
                     metrics.log_scalar(
-                        "gb_total",
-                        gb_total,
-                        priority=1600,
-                        round=1,
-                        weight=0,
+                        "gb_total", gb_total, priority=1600, round=1, weight=0
                     )
 
                     logging_output = self._reduce_and_log_stats(
-                        logging_outputs,
-                        sample_size,
-                        grad_norm,
+                        logging_outputs, sample_size, grad_norm
                     )
 
                 # log whenever there's an XLA compilation, since these
@@ -744,11 +742,18 @@ class Trainer(object):
                 # optimization
                 self._check_xla_compilation()
             else:
+                if self.cuda and self.cuda_env is not None:
+                    # log minimum free memory over the iteration
+                    gb_used = torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024
+                    torch.cuda.reset_peak_memory_stats()
+                    gb_free = self.cuda_env.total_memory_in_GB - gb_used
+                    metrics.log_scalar(
+                        "gb_free", gb_free, priority=1500, round=1, weight=0
+                    )
+
                 # log stats
                 logging_output = self._reduce_and_log_stats(
-                    logging_outputs,
-                    sample_size,
-                    grad_norm,
+                    logging_outputs, sample_size, grad_norm
                 )
 
                 # clear CUDA cache to reduce memory fragmentation
@@ -1120,7 +1125,7 @@ class Trainer(object):
                 # use FloatingPointError to trigger NanDetector
                 raise FloatingPointError(
                     "Fatal error: gradients are inconsistent between workers. "
-                    "Try --ddp-backend=no_c10d. "
+                    "Try --ddp-backend=legacy_ddp. "
                     "Or are you mixing up different generation of GPUs in training?"
                     + "\n"
                     + "-" * 80
